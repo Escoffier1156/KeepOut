@@ -340,6 +340,12 @@ def property_based_test_equivalence(
                 """Legacy single-value cases still exercise multi-arg functions."""
                 return tuple(value if kind == "int" else float(value) for kind in kinds)
 
+            def counterexample_input(args):
+                """Preserve the historical scalar shape for single-argument
+                functions: counterexamples cached in existing keepout.json files
+                are scalars, and rewriting them as lists would orphan them."""
+                return args[0] if len(args) == 1 else list(args)
+
             # 1. First priority: cached historical counterexamples (instant regression check)
             executed = 0
             for ce_val in cached_counterexamples:
@@ -362,7 +368,8 @@ def property_based_test_equivalence(
                             f"  Expected Output (Original): {res_a}\n"
                             f"  Actual Output (Modified): {res_b}"
                         ),
-                        counterexample={"input": list(args), "output_a": res_a, "output_b": res_b}
+                        counterexample={"input": counterexample_input(args),
+                                        "output_a": res_a, "output_b": res_b}
                     )
 
             # 2. Deterministic PBT with a fixed seed
@@ -385,7 +392,8 @@ def property_based_test_equivalence(
                             f"  Expected Output (Original): {res_a}\n"
                             f"  Actual Output (Modified): {res_b}"
                         ),
-                        counterexample={"input": list(args), "output_a": res_a, "output_b": res_b}
+                        counterexample={"input": counterexample_input(args),
+                                        "output_a": res_a, "output_b": res_b}
                     )
 
             # Verifying nothing is not the same as verifying equivalence. If every
