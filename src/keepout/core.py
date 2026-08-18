@@ -1,6 +1,7 @@
 """Core module for KeepOut: Smart Syntax Locking & Deterministic PBT with Counterexample Caching."""
 
 import ast
+import inspect
 from dataclasses import dataclass
 import hashlib
 import json
@@ -299,55 +300,113 @@ def property_based_test_equivalence(
             func_a = [v for k, v in loc_a.items() if callable(v)][0]
             func_b = [v for k, v in loc_b.items() if callable(v)][0]
 
-            # 1. First priority: Check against cached historical counterexamples (instant regression check)
+            # Build argument vectors from the signature, so functions of any arity
+            # can be verified - not just single-argument ones. Type annotations pick
+            # the domain (float -> reals, int -> integers, bool -> booleans); an
+            # unannotated parameter gets integers, which is the old behaviour.
+            try:
+                signature = inspect.signature(func_a)
+                parameters = [
+                    param for param in signature.parameters.values()
+                    if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
+                ]
+            except (TypeError, ValueError):
+                parameters = []
+
+            INT_EDGES = [0, 1, -1, 42, -42, 2**16 - 1, 2**31 - 1, -2**31, 2**63 - 1, -2**63]
+            FLOAT_EDGES = [0.0, 1.0, -1.0, 0.5, -0.5, 1e-9, 1e9, -1e9, 1234.5678, 0.00125]
+
+            def domain_for(param) -> str:
+                annotation = param.annotation
+                if annotation is float:
+                    return "float"
+                if annotation is bool:
+                    return "bool"
+                if annotation is int:
+                    return "int"
+                return "int"
+
+            def sample(kind: str, rng_local, index: int):
+                if kind == "float":
+                    return FLOAT_EDGES[index] if index < len(FLOAT_EDGES) else rng_local.uniform(-1e6, 1e6)
+                if kind == "bool":
+                    return bool(index % 2)
+                return INT_EDGES[index] if index < len(INT_EDGES) else rng_local.randint(-10**9, 10**9)
+
+            kinds = [domain_for(param) for param in parameters] or ["int"]
+            arity = len(kinds)
+
+            def build_vector(value):
+                """Legacy single-value cases still exercise multi-arg functions."""
+                return tuple(value if kind == "int" else float(value) for kind in kinds)
+
+            # 1. First priority: cached historical counterexamples (instant regression check)
+            executed = 0
             for ce_val in cached_counterexamples:
+                args = tuple(ce_val) if isinstance(ce_val, (list, tuple)) else build_vector(ce_val)
+                if len(args) != arity:
+                    continue
                 try:
-                    res_a = func_a(ce_val)
-                    res_b = func_b(ce_val)
-                    if res_a != res_b:
-                        return EquivalenceResult(
-                            is_equivalent=False,
-                            status_str="pbt_fail",
-                            message=(
-                                f"🚨 Instant Regression Detected (Cached Counterexample)! Mismatch found:\n"
-                                f"  Cached Input: {ce_val}\n"
-                                f"  Expected Output (Original): {res_a}\n"
-                                f"  Actual Output (Modified): {res_b}"
-                            ),
-                            counterexample={"input": ce_val, "output_a": res_a, "output_b": res_b}
-                        )
+                    res_a = func_a(*args)
+                    res_b = func_b(*args)
                 except Exception:
                     continue
+                executed += 1
+                if res_a != res_b:
+                    return EquivalenceResult(
+                        is_equivalent=False,
+                        status_str="pbt_fail",
+                        message=(
+                            f"🚨 Instant Regression Detected (Cached Counterexample)! Mismatch found:\n"
+                            f"  Cached Input: {args}\n"
+                            f"  Expected Output (Original): {res_a}\n"
+                            f"  Actual Output (Modified): {res_b}"
+                        ),
+                        counterexample={"input": list(args), "output_a": res_a, "output_b": res_b}
+                    )
 
-            # 2. Second priority: Run deterministic reproducible PBT with fixed seed
+            # 2. Deterministic PBT with a fixed seed
             rng = random.Random(seed)
-            edge_cases = [0, 1, -1, 42, -42, 2**16-1, 2**31-1, -2**31, 2**63-1, -2**63]
-            random_cases = [rng.randint(-10**9, 10**9) for _ in range(num_samples - len(edge_cases))]
-            test_vector = edge_cases + random_cases
-
-            for val in test_vector:
+            for index in range(num_samples):
+                args = tuple(sample(kind, rng, index) for kind in kinds)
                 try:
-                    res_a = func_a(val)
-                    res_b = func_b(val)
-                    if res_a != res_b:
-                        return EquivalenceResult(
-                            is_equivalent=False,
-                            status_str="pbt_fail",
-                            message=(
-                                f"🚨 Logic Mismatch Detected (Deterministic PBT)! Counterexample found:\n"
-                                f"  Input Parameter: {val}\n"
-                                f"  Expected Output (Original): {res_a}\n"
-                                f"  Actual Output (Modified): {res_b}"
-                            ),
-                            counterexample={"input": val, "output_a": res_a, "output_b": res_b}
-                        )
+                    res_a = func_a(*args)
+                    res_b = func_b(*args)
                 except Exception:
                     continue
+                executed += 1
+                if res_a != res_b:
+                    return EquivalenceResult(
+                        is_equivalent=False,
+                        status_str="pbt_fail",
+                        message=(
+                            f"🚨 Logic Mismatch Detected (Deterministic PBT)! Counterexample found:\n"
+                            f"  Input Parameters: {args}\n"
+                            f"  Expected Output (Original): {res_a}\n"
+                            f"  Actual Output (Modified): {res_b}"
+                        ),
+                        counterexample={"input": list(args), "output_a": res_a, "output_b": res_b}
+                    )
+
+            # Verifying nothing is not the same as verifying equivalence. If every
+            # sample raised - wrong arity, unsupported types, side effects - say so
+            # and block, rather than reporting a pass that rests on zero evidence.
+            if executed == 0:
+                return EquivalenceResult(
+                    is_equivalent=False,
+                    status_str="pbt_unverifiable",
+                    message=(
+                        "🚨 PBT could not execute this block (0 samples ran).\n"
+                        f"  Detected arity: {arity}. Every generated call raised.\n"
+                        "  This lock verifies nothing as written - use [LOCK] (AST) or\n"
+                        "  [LOCK: strict] for code that PBT cannot drive."
+                    ),
+                )
 
             return EquivalenceResult(
                 is_equivalent=True,
                 status_str="pbt_pass",
-                message=f"✨ Passed Deterministic PBT across {num_samples} reproducible test inputs (seed={seed})!"
+                message=f"✨ Passed Deterministic PBT: {executed} executed samples over arity {arity} (seed={seed})!"
             )
         except Exception:
             pass
