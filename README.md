@@ -26,6 +26,72 @@ Refactored for maximum production usability, KeepOut features **Smart Syntax Loc
 
 ---
 
+## ⚠️ Lock Invariants, Not Implementations
+
+This is the one rule that decides whether KeepOut helps you or hurts you.
+
+KeepOut enforces *"this must not change."* It cannot tell you *"this is correct."*
+Lock the wrong thing and you have built a machine for preserving a bug.
+
+**A real case.** A production trading engine locked nine regions with
+`# [LOCK: logic]`. Every one of them was an *implementation*:
+
+| Locked region | What it actually contained |
+| :--- | :--- |
+| `KabutanScraper` | a parser reading the trade-count column as volume |
+| `LineNotifier` | notifications that failed 403 in silence |
+| `ExtremeValueTheoryEVT` | `md5(ticker) % 13` dressed up as tail-risk analysis |
+| `MonteCarloPathSimulator` | the same, as path simulation |
+| `JQuantsAPIClient` | a hardcoded list of fictional stocks at fixed prices |
+| `ATRDynamicTrailingEngine` | a `+4%` hard cut, and targets of `+58%` on a day trade |
+| `SlotRotationManager` | a 5-slot book that grew to 6 positions |
+
+KeepOut protected all of it, faithfully and exactly as instructed, while the
+system quietly reported profits it had not made. The tool did its job. The
+choice of what to lock did not.
+
+### The test
+
+Ask one question about the region:
+
+> **If this changed silently, would every number downstream become quietly wrong?**
+
+| Lock it ✅ | Leave it open ❌ |
+| :--- | :--- |
+| Physical/financial constants (fee rates, unit sizes) | Anything that parses an external site or API |
+| The single definition of a core calculation | Tunable strategy parameters |
+| Invariant assertions - the guarantees themselves | Logic you intend to evolve on evidence |
+| Security constants, protocol magic numbers | Anything you may need to hotfix under time pressure |
+
+The right-hand column matters as much as the left. Locking an HTML scraper is
+actively dangerous: when the site changes its markup mid-session, the safety
+property you need is *being able to patch it in three minutes* - and the lock
+works directly against that.
+
+### Locking the same engine, done well
+
+The same project, rebuilt, locks four regions and nothing else:
+
+```python
+# [LOCK: strict]
+FRICTION_PER_SIDE = 0.00125   # duplicated in the web UI; drift = silent disagreement
+# [/LOCK]
+
+# [LOCK: pbt]
+def net_pnl(entry_price: float, exit_price: float, shares: int):
+    """Restructure freely - the numbers must not move."""
+# [/LOCK]
+
+# [LOCK]
+def assert_invariants(self) -> None:
+    """The 5-slot guarantee itself."""
+# [/LOCK]
+```
+
+Its scrapers, thresholds and selection logic are deliberately left open.
+
+---
+
 ## 🧠 Deterministic PBT & Counterexample Caching
 
 ```
@@ -48,6 +114,25 @@ Refactored for maximum production usability, KeepOut features **Smart Syntax Loc
 
 1. **Deterministic Seed (No Flaky Tests)**: Fixed PRNG seed guarantees 100% reproducible test vectors across local and CI runs.
 2. **Counterexample Caching**: When a bug or logic mismatch is caught, KeepOut automatically caches the failing input parameter inside `keepout.json`. On subsequent checks, KeepOut checks cached counterexamples **first**, preventing regressions in 0.0001 seconds.
+
+### What `[LOCK: pbt]` can and cannot verify
+
+The PBT engine executes the region and compares outputs, so it applies to a
+specific shape of code:
+
+| Works | Does not work |
+| :--- | :--- |
+| Pure functions of any arity | Functions performing I/O (network, disk, clock) |
+| Parameters annotated `int` / `float` / `bool` | Parameters taking objects, dicts or collections |
+| Deterministic outputs | Anything whose result depends on external state |
+
+Argument domains follow the type annotations - annotate your parameters and the
+engine drives them properly. For code PBT cannot execute, use `[LOCK]` (AST
+structural) or `[LOCK: strict]` instead; both verify without running anything.
+
+**If no sample executes, KeepOut blocks rather than passes.** A lock reporting
+success while having verified nothing is worse than no lock at all, so this case
+returns `pbt_unverifiable` and names the arity it detected.
 
 ---
 
@@ -122,6 +207,14 @@ const int MAX_RETRY_COUNT = 5;
 ```
 
 ---
+
+## 🎯 Choosing a Mode
+
+| Mode | Verifies | Reach for it when |
+| :--- | :--- | :--- |
+| `[LOCK: strict]` | exact bytes | constants, magic numbers - one correct value exists |
+| `[LOCK]` / `[LOCK: ast]` | code structure | guarantees and algorithms that may be reformatted or renamed, never restructured |
+| `[LOCK: pbt]` | observable behaviour | pure calculations you *do* want refactored, as long as outputs never move |
 
 ## 🧪 Running Tests
 
